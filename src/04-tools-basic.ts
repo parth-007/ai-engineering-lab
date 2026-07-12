@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
+import { z } from "zod";
 import "dotenv/config";
 
 const client = new OpenAI();
@@ -12,6 +13,57 @@ type ContractorRecord = {
   status: string;
   taxFormStatus: string;
 };
+
+const ContractorIdSchema = z
+  .string()
+  .regex(/^CTR-\d{3}$/, "Contractor ID must match CTR-XXX, for example CTR-001");
+
+const GetContractorInfoArgsSchema = z
+  .object({
+    contractor_id: ContractorIdSchema,
+  })
+  .strict();
+
+const ListContractorsArgsSchema = z.object({}).strict();
+
+const CreateContractorArgsSchema = z
+  .object({
+    id: ContractorIdSchema.optional(),
+    name: z.string().min(1, "Name is required"),
+    country: z.string().length(2, "Country must be a two-letter country code"),
+    status: z.string().min(1, "Status is required"),
+    tax_form_status: z.string().min(1, "Tax form status is required"),
+  })
+  .strict();
+
+const UpdateContractorArgsSchema = z
+  .object({
+    contractor_id: ContractorIdSchema,
+    name: z.string().min(1, "Name cannot be empty").optional(),
+    country: z.string().length(2, "Country must be a two-letter country code").optional(),
+    status: z.string().min(1, "Status cannot be empty").optional(),
+    tax_form_status: z.string().min(1, "Tax form status cannot be empty").optional(),
+  })
+  .strict()
+  .refine(
+    ({ name, country, status, tax_form_status }) =>
+      [name, country, status, tax_form_status].some((value) => value !== undefined),
+    "Provide at least one field to update",
+  );
+
+const DeleteContractorArgsSchema = z
+  .object({
+    contractor_id: ContractorIdSchema,
+  })
+  .strict();
+
+const validationError = (error: z.ZodError) =>
+  JSON.stringify({
+    error: "invalid_tool_arguments",
+    message: error.issues
+      .map((issue) => `${issue.path.join(".") || "arguments"}: ${issue.message}`)
+      .join("; "),
+  });
 
 const contractorRecordDB: Record<string, ContractorRecord> = {
   "CTR-001": {
@@ -224,30 +276,85 @@ const tools: OpenAI.ChatCompletionTool[] = [
 ];
 
 const runTool = (name: string, rawArguments: string) => {
-  const args = JSON.parse(rawArguments || "{}");
+  let rawArgs: unknown;
+  try {
+    rawArgs = JSON.parse(rawArguments || "{}");
+  } catch (error) {
+    return JSON.stringify({
+      error: "invalid_json",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   switch (name) {
-    case "get_contractor_info":
+    case "get_contractor_info": {
+      const result = GetContractorInfoArgsSchema.safeParse(rawArgs);
+      if (!result.success) {
+        return validationError(result.error);
+      }
+
+      const args = result.data;
       return getContractorInfo(args.contractor_id);
-    case "list_contractors":
+    }
+    case "list_contractors": {
+      const result = ListContractorsArgsSchema.safeParse(rawArgs);
+      if (!result.success) {
+        return validationError(result.error);
+      }
+
       return listContractors();
-    case "create_contractor":
-      return createContractor({
-        id: args.id,
+    }
+    case "create_contractor": {
+      const result = CreateContractorArgsSchema.safeParse(rawArgs);
+      if (!result.success) {
+        return validationError(result.error);
+      }
+
+      const args = result.data;
+      const contractor: Omit<ContractorRecord, "id"> & { id?: string } = {
         name: args.name,
         country: args.country,
         status: args.status,
         taxFormStatus: args.tax_form_status,
-      });
-    case "update_contractor":
-      return updateContractor(args.contractor_id, {
-        name: args.name,
-        country: args.country,
-        status: args.status,
-        taxFormStatus: args.tax_form_status,
-      });
-    case "delete_contractor":
+      };
+      if (args.id !== undefined) {
+        contractor.id = args.id;
+      }
+
+      return createContractor(contractor);
+    }
+    case "update_contractor": {
+      const result = UpdateContractorArgsSchema.safeParse(rawArgs);
+      if (!result.success) {
+        return validationError(result.error);
+      }
+
+      const args = result.data;
+      const updates: Partial<Omit<ContractorRecord, "id">> = {};
+      if (args.name !== undefined) {
+        updates.name = args.name;
+      }
+      if (args.country !== undefined) {
+        updates.country = args.country;
+      }
+      if (args.status !== undefined) {
+        updates.status = args.status;
+      }
+      if (args.tax_form_status !== undefined) {
+        updates.taxFormStatus = args.tax_form_status;
+      }
+
+      return updateContractor(args.contractor_id, updates);
+    }
+    case "delete_contractor": {
+      const result = DeleteContractorArgsSchema.safeParse(rawArgs);
+      if (!result.success) {
+        return validationError(result.error);
+      }
+
+      const args = result.data;
       return deleteContractor(args.contractor_id);
+    }
     default:
       return JSON.stringify({
         error: "unknown_tool",
